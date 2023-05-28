@@ -1,0 +1,9 @@
+{
+  "perms": {},
+  "dom": {},
+  "logic": {
+    "modules": {
+      "local://main": "export function OnUpdate() { Deno.core.ops.op_print('This is a taco.'); }"
+    }
+  }
+}
