@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::time::Duration;
+use std::time::Instant;
 
 use deno_core::error::AnyError;
 use deno_core::futures::FutureExt;
@@ -12,6 +14,8 @@ use deno_core::ModuleSource;
 use deno_core::RuntimeOptions;
 
 use tokio::runtime::Builder;
+use tokio::sync::mpsc::error::SendError;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
@@ -31,13 +35,13 @@ impl Logic {
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum LogicModule {
-    Source { src: String },
+    Direct { src: String },
 }
 
 impl LogicModule {
     fn resolve(&self) -> Result<Box<[u8]>, AnyError> {
         match self {
-            LogicModule::Source { src } => Ok(src.as_bytes().to_vec().into_boxed_slice()),
+            LogicModule::Direct { src } => Ok(src.as_bytes().to_vec().into_boxed_slice()),
         }
     }
 }
@@ -75,10 +79,13 @@ impl ModuleLoader for Logic {
     }
 }
 
+type LogicInstInput = (Instant, LogicInputEvent);
+type LogicInstOutput = (LogicOutputEvent);
+
 #[derive(Debug)]
 pub struct LogicInst {
-    pub input: UnboundedSender<LogicInputEvent>,
-    pub output: UnboundedReceiver<LogicOutputEvent>,
+    input: UnboundedSender<LogicInstInput>,
+    pub output: UnboundedReceiver<LogicInstOutput>,
 }
 
 impl LogicInst {
@@ -98,36 +105,41 @@ impl LogicInst {
             output: out_recv,
         })
     }
+
+    pub fn send(&mut self, input: LogicInputEvent) -> Result<(), AnyError> {
+        let send_time = Instant::now();
+        self.input.send((send_time, input))?;
+        Ok(())
+    }
 }
 
 struct LogicRuntimeRoot {
     runtime: LogicRuntime,
 
-    inputs: UnboundedReceiver<LogicInputEvent>,
-    outputs: UnboundedSender<LogicOutputEvent>,
+    inputs: UnboundedReceiver<LogicInstInput>,
+    outputs: UnboundedSender<LogicInstOutput>,
 }
 
 impl LogicRuntimeRoot {
     fn poll_runtime_proxy(
         module_loader: Logic,
         url: Url,
-        mut inputs: UnboundedReceiver<LogicInputEvent>,
-        outputs: UnboundedSender<LogicOutputEvent>,
+        mut inputs: UnboundedReceiver<LogicInstInput>,
+        outputs: UnboundedSender<LogicInstOutput>,
     ) {
         let rt = Builder::new_current_thread().enable_all().build().unwrap();
 
         let local = LocalSet::new();
         local.spawn_local(async move {
-            let maybe_runtime = LogicRuntime::spawn_runtime(module_loader, &url).await;
-            match maybe_runtime {
+            match LogicRuntime::spawn_runtime(module_loader, &url).await {
                 Ok(runtime) => {
-                    let mut runtime_root = LogicRuntimeRoot {
+                    LogicRuntimeRoot {
                         runtime,
                         inputs,
                         outputs,
-                    };
-
-                    runtime_root.run_proxy().await;
+                    }
+                    .run_proxy()
+                    .await;
                 }
                 Err(e) => {
                     inputs.close();
@@ -140,25 +152,49 @@ impl LogicRuntimeRoot {
     }
 
     async fn run_proxy(&mut self) {
-        while let Some(msg) = self.inputs.recv().await {
-            if let Err(e) = self.process_message(msg).await {
+        loop {
+            if let Err(e) = self.run_internal().await {
+                self.runtime.close().await;
                 self.inputs.close();
                 let _ = self.outputs.send(LogicOutputEvent::Err(e));
+                return;
             }
         }
-        self.runtime.close().await;
     }
 
-    async fn process_message(&mut self, input: LogicInputEvent) -> Result<(), AnyError> {
+    async fn run_internal(&mut self) -> Result<(), AnyError> {
+        self.runtime.run_event_loop().await?;
+
+        match self.inputs.try_recv() {
+            Ok((send_time, msg)) => self.process_message(send_time, msg).await?,
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => Err(TryRecvError::Disconnected)?,
+        }
+        Ok(())
+    }
+
+    async fn process_message(
+        &mut self,
+        send_time: Instant,
+        input: LogicInputEvent,
+    ) -> Result<(), AnyError> {
         match input {
-            LogicInputEvent::Update(delta_t) => self.runtime.on_update(delta_t)?,
-            LogicInputEvent::Close => self.inputs.close(),
+            LogicInputEvent::Update(delta_t) => {
+                let start = Instant::now();
+                let runtime = self.runtime.on_update(delta_t)?;
+                println!(
+                    "Message delay: {:?}, took {:?}",
+                    start.duration_since(send_time),
+                    runtime
+                );
+            }
         }
         Ok(())
     }
 }
 
 pub struct LogicRuntime {
+    update_counter: u64,
     runtime: JsRuntime,
     this: v8::Global<v8::Object>,
     on_update: Option<v8::Global<v8::Function>>,
@@ -167,7 +203,6 @@ pub struct LogicRuntime {
 #[derive(Debug)]
 pub enum LogicInputEvent {
     Update(f64),
-    Close,
 }
 
 #[derive(Debug)]
@@ -211,13 +246,20 @@ impl LogicRuntime {
         };
 
         Ok(Self {
+            update_counter: 0,
             runtime,
             on_update,
             this,
         })
     }
 
-    pub fn on_update(&mut self, delta_t: f64) -> Result<(), deno_core::error::AnyError> {
+    pub async fn run_event_loop(&mut self) -> Result<(), AnyError> {
+        self.runtime.run_event_loop(false).await?;
+        Ok(())
+    }
+
+    pub fn on_update(&mut self, delta_t: f64) -> Result<Duration, deno_core::error::AnyError> {
+        let start = Instant::now();
         let scope = &mut self.runtime.handle_scope();
         if let Some(on_update) = self.on_update.as_ref() {
             let on_update = v8::Local::new(scope, on_update);
@@ -230,7 +272,9 @@ impl LogicRuntime {
             on_update.call(scope, this.into(), &[]);
         }
 
-        Ok(())
+        self.update_counter += 1;
+
+        Ok(Instant::now().duration_since(start))
     }
 
     pub async fn close(&mut self) {}

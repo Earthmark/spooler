@@ -39,10 +39,9 @@ pub fn manifest_spawner(mut spawn_event: EventReader<ManifestSpawnEvent>, mut c:
 }
 
 pub fn update_dt(mut query: Query<&mut LogicComponent>, time: Res<Time>) {
-    for logic in query.iter_mut() {
+    for mut logic in query.iter_mut() {
         let _ = logic
             .0
-            .input
             .send(crate::logic::runtime::LogicInputEvent::Update(
                 time.delta_seconds_f64(),
             ));

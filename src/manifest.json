@@ -3,8 +3,8 @@
   "logic": {
     "modules": {
       "local://main": {
-        "type": "source",
-        "src": "export function OnUpdate() { Deno.core.ops.op_print('Delta taco: ' + this.deltaTime); }"
+        "type": "direct",
+        "src": "export function OnUpdate() { Deno.core.ops.op_print('Delta taco: ' + this.deltaTime + '\\n'); }"
       }
     }
   }
