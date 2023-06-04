@@ -22,26 +22,4 @@ fn main() {
         .add_system(manifest::manifest_spawner)
         .add_startup_system(startup)
         .run();
-
-    /*
-    let manifest = manifest::Manifest::parse(include_bytes!("manifest.json")).unwrap();
-
-    let mut instance = Box::new(manifest.spawn());
-
-    println!("Manifest {:#?}", &manifest);
-    println!("Instance {:#?}", &instance);
-
-    if let Some(inst) = instance.logic.as_mut() {
-        inst.input
-            .send(logic::runtime::LogicInputEvent::Update(0.3))
-            .unwrap();
-        inst.input
-            .send(logic::runtime::LogicInputEvent::Close)
-            .unwrap();
-
-        while let Ok(out) = inst.output.try_recv() {
-            println!("Got {:#?}", out);
-        }
-    }
-     */
 }
