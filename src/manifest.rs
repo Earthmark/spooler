@@ -20,7 +20,7 @@ impl Manifest {
     pub fn spawn(&self, c: &mut EntityCommands) {
         // if let Some(dom) = self.dom.as_ref() {}
         if let Some(logic) = self.logic.as_ref() {
-            c.insert(LogicComponent(logic.spawn().unwrap()));
+            c.insert(LogicComponent(logic.clone().spawn().unwrap()));
         }
     }
 }

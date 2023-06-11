@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
@@ -28,8 +29,8 @@ pub struct Logic {
 }
 
 impl Logic {
-    pub fn spawn(&self) -> Result<LogicInst, AnyError> {
-        LogicInst::new(&self, &Url::parse("local://main").unwrap())
+    pub fn spawn(self) -> Result<LogicInst, AnyError> {
+        LogicInst::new(self, Url::parse("local://main").unwrap())
     }
 }
 
@@ -95,12 +96,9 @@ pub struct LogicInst {
 }
 
 impl LogicInst {
-    fn new(module_loader: &Logic, url: &Url) -> Result<Self, deno_core::error::AnyError> {
+    fn new(module_loader: Logic, url: Url) -> Result<Self, deno_core::error::AnyError> {
         let (in_send, in_recv) = unbounded_channel();
         let (out_send, out_recv) = unbounded_channel();
-
-        let module_loader = module_loader.clone();
-        let url = url.clone();
 
         std::thread::spawn(|| {
             LogicRuntimeRoot::poll_runtime_proxy(module_loader, url, in_recv, out_send);
@@ -192,6 +190,143 @@ impl LogicRuntimeRoot {
             }
         }
         Ok(())
+    }
+}
+
+pub trait RuntimeExposed: Sized {
+    fn setup_template(template: &mut ExposedTypeBinder<Self>);
+}
+
+pub fn create_runtime_template<'a, Exposed>(
+    scope: &'a mut v8::HandleScope<'a>,
+) -> (
+    v8::Local<'a, v8::ObjectTemplate>,
+    RuntimeExposedBinding<Exposed>,
+)
+where
+    Exposed: RuntimeExposed,
+{
+    let template = v8::ObjectTemplate::new(scope);
+    template.set_internal_field_count(1);
+
+    let mut binder = ExposedTypeBinder {
+        scope,
+        template: &template,
+        binding: RuntimeExposedBinding {
+            field_num: 0,
+            _t: Default::default(),
+        },
+    };
+
+    Exposed::setup_template(&mut binder);
+
+    (template, binder.binding)
+}
+
+pub struct RuntimeExposedBinding<Type> {
+    field_num: usize,
+    _t: PhantomData<Type>,
+}
+
+impl<Type> RuntimeExposedBinding<Type> {
+    pub fn set_internal_field(
+        &self,
+        scope: &mut v8::HandleScope,
+        obj: &mut Box<Type>,
+        target: v8::Local<v8::Object>,
+    ) {
+        let external = v8::External::new(scope, &mut **obj as *mut Type as *mut c_void);
+        target.set_internal_field(self.field_num, external.into());
+    }
+}
+
+pub struct ExposedTypeBinder<'a, 'b, BoundType> {
+    scope: &'a mut v8::HandleScope<'a>,
+    template: &'b v8::Local<'a, v8::ObjectTemplate>,
+    binding: RuntimeExposedBinding<BoundType>,
+}
+
+impl<BoundType: RuntimeExposed> ExposedTypeBinder<'_, '_, BoundType> {
+    fn set_accessor<Getter, AccessorResult>(&mut self, name: &str, getter: Getter)
+    where
+        Getter: Fn(&BoundType, &mut v8::HandleScope) -> AccessorResult,
+        AccessorResult : ExposedReturnable,
+    {
+        let scope = &mut self.scope;
+        let name = v8::String::new(scope, name).unwrap();
+
+        let field_num = self.binding.field_num;
+        self.template.set_accessor(
+            name.into(),
+            |scope: &mut v8::HandleScope,
+             _key: v8::Local<v8::Name>,
+             args: v8::PropertyCallbackArguments,
+             rv: v8::ReturnValue| {
+                let this = args.this();
+                let local = Self::get_external(scope, &this, field_num);
+                let result = getter(local, scope);
+                result.set(rv);
+            },
+        );
+    }
+
+    fn get_external<'a, T>(
+        scope: &mut v8::HandleScope,
+        obj: &v8::Local<'a, v8::Object>,
+        field_num: usize,
+    ) -> &'a T {
+        let external = obj.get_internal_field(scope, field_num).unwrap();
+        let external = unsafe { v8::Local::<v8::External>::cast(external) };
+        unsafe { &*(external.value() as *const T) }
+    }
+}
+
+impl RuntimeExposed for RuntimeHandles {
+    fn setup_template(template: &mut ExposedTypeBinder<Self>) {
+        template.set_accessor("deltaTime", |s, _scope| *s.delta_t);
+    }
+}
+
+trait ExposedReturnable {
+    fn set(self, rv: v8::ReturnValue);
+}
+
+impl ExposedReturnable for f64 {
+    fn set(self, mut rv: v8::ReturnValue) {
+        rv.set_double(self);
+    }
+}
+
+impl ExposedReturnable for bool {
+    fn set(self, mut rv: v8::ReturnValue) {
+        rv.set_bool(self);
+    }
+}
+
+impl ExposedReturnable for i32 {
+    fn set(self, mut rv: v8::ReturnValue) {
+        rv.set_int32(self);
+    }
+}
+
+impl ExposedReturnable for u32 {
+    fn set(self, mut rv: v8::ReturnValue) {
+        rv.set_uint32(self);
+    }
+}
+
+impl<'cb> ExposedReturnable for v8::Local<'cb, v8::Value> {
+    fn set(self, mut rv: v8::ReturnValue) {
+        rv.set(self);
+    }
+}
+
+impl<T : ExposedReturnable> ExposedReturnable for Option<T> {
+    fn set(self, mut rv: v8::ReturnValue) {
+        match self {
+            Some(inner) => inner.set(rv),
+            None => rv.set_null()
+        };
     }
 }
 
