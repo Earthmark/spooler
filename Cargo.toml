@@ -9,6 +9,8 @@ serde = { version = "*", features = ["derive", "rc"] }
 serde_json = "*"
 deno_core = "*"
 tokio = { version = "*", features = ["full"] }
+async-trait = "*"
+lazy_static = "*"
 
 [dev-dependencies]
 criterion = "*"

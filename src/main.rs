@@ -16,10 +16,9 @@ fn startup(mut c: Commands, mut spawn_event: EventWriter<manifest::ManifestSpawn
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
+        .add_plugins(logic::LogicPlugin)
         .add_event::<manifest::ManifestSpawnEvent>()
-        .add_system(manifest::update_dt)
-        .add_system(manifest::read_messages)
-        .add_system(manifest::manifest_spawner)
-        .add_startup_system(startup)
+        .add_systems(Update, manifest::manifest_spawner)
+        .add_systems(Startup, startup)
         .run();
 }

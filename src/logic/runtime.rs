@@ -1,204 +1,26 @@
-use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::marker::PhantomData;
-use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
 
 use deno_core::error::AnyError;
-use deno_core::futures::FutureExt;
 use deno_core::url::Url;
 use deno_core::v8;
 use deno_core::v8::HandleScope;
 use deno_core::JsRuntime;
-use deno_core::ModuleLoader;
-use deno_core::ModuleSource;
 use deno_core::RuntimeOptions;
 
-use tokio::runtime::Builder;
-use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::mpsc::unbounded_channel;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::task::LocalSet;
-
-#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
-pub struct Logic {
-    modules: BTreeMap<Url, LogicModule>,
-}
-
-impl Logic {
-    pub fn spawn(self) -> Result<LogicInst, AnyError> {
-        LogicInst::new(self, Url::parse("local://main").unwrap())
-    }
-}
-
-#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum LogicModule {
-    Direct { src: String },
-}
-
-impl LogicModule {
-    fn resolve(&self) -> Result<Box<[u8]>, AnyError> {
-        match self {
-            LogicModule::Direct { src } => Ok(src.as_bytes().to_vec().into_boxed_slice()),
-        }
-    }
-}
-
-impl ModuleLoader for Logic {
-    fn resolve(
-        &self,
-        specifier: &str,
-        referrer: &str,
-        _is_main: bool,
-    ) -> Result<deno_core::ModuleSpecifier, bevy::asset::Error> {
-        Ok(deno_core::resolve_import(specifier, referrer)?)
-    }
-
-    fn load(
-        &self,
-        module_specifier: &deno_core::ModuleSpecifier,
-        _maybe_referrer: Option<deno_core::ModuleSpecifier>,
-        _is_dyn_import: bool,
-    ) -> Pin<Box<deno_core::ModuleSourceFuture>> {
-        let module_specifier = module_specifier.clone();
-        let modules = self.modules.clone();
-        async move {
-            modules
-                .get(&module_specifier)
-                .ok_or(deno_core::error::generic_error("Module not found"))
-                .map(|code| ModuleSource {
-                    code: code.resolve().unwrap(),
-                    module_type: deno_core::ModuleType::JavaScript,
-                    module_url_specified: module_specifier.to_string(),
-                    module_url_found: module_specifier.to_string(),
-                })
-        }
-        .boxed_local()
-    }
-}
-
-type LogicInstOutput = LogicOutputEvent;
-
-#[derive(Debug)]
-struct LogicInstEvent {
-    input: LogicInputEvent,
-    send_time: Instant,
-}
-
-#[derive(Debug)]
-pub struct LogicInst {
-    input: UnboundedSender<LogicInstEvent>,
-    pub output: UnboundedReceiver<LogicInstOutput>,
-}
-
-impl LogicInst {
-    fn new(module_loader: Logic, url: Url) -> Result<Self, deno_core::error::AnyError> {
-        let (in_send, in_recv) = unbounded_channel();
-        let (out_send, out_recv) = unbounded_channel();
-
-        std::thread::spawn(|| {
-            LogicRuntimeRoot::poll_runtime_proxy(module_loader, url, in_recv, out_send);
-        });
-
-        Ok(Self {
-            input: in_send,
-            output: out_recv,
-        })
-    }
-
-    pub fn send(&mut self, input: LogicInputEvent) -> Result<(), AnyError> {
-        let send_time = Instant::now();
-        self.input.send(LogicInstEvent { send_time, input })?;
-        Ok(())
-    }
-}
-
-struct LogicRuntimeRoot {
-    runtime: LogicRuntime,
-
-    inputs: UnboundedReceiver<LogicInstEvent>,
-    outputs: UnboundedSender<LogicInstOutput>,
-}
-
-impl LogicRuntimeRoot {
-    fn poll_runtime_proxy(
-        module_loader: Logic,
-        url: Url,
-        mut inputs: UnboundedReceiver<LogicInstEvent>,
-        outputs: UnboundedSender<LogicInstOutput>,
-    ) {
-        let rt = Builder::new_current_thread().enable_all().build().unwrap();
-
-        let local = LocalSet::new();
-        local.spawn_local(async move {
-            match LogicRuntime::spawn_runtime(module_loader, &url).await {
-                Ok(runtime) => {
-                    LogicRuntimeRoot {
-                        runtime,
-                        inputs,
-                        outputs,
-                    }
-                    .run_proxy()
-                    .await;
-                }
-                Err(e) => {
-                    inputs.close();
-                    let _ = outputs.send(LogicOutputEvent::Err(e));
-                }
-            }
-        });
-
-        rt.block_on(local)
-    }
-
-    async fn run_proxy(&mut self) {
-        loop {
-            if let Err(e) = self.run_internal().await {
-                self.runtime.close().await;
-                self.inputs.close();
-                let _ = self.outputs.send(LogicOutputEvent::Err(e));
-                return;
-            }
-        }
-    }
-
-    async fn run_internal(&mut self) -> Result<(), AnyError> {
-        self.runtime.run_event_loop().await?;
-
-        match self.inputs.try_recv() {
-            Ok(event) => self.process_message(event).await?,
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => Err(TryRecvError::Disconnected)?,
-        }
-        Ok(())
-    }
-
-    async fn process_message(&mut self, event: LogicInstEvent) -> Result<(), AnyError> {
-        match event.input {
-            LogicInputEvent::Update(delta_t) => {
-                let start = Instant::now();
-                let runtime = self.runtime.on_update(delta_t)?;
-                println!(
-                    "Message delay: {:?}, took {:#?}",
-                    start.duration_since(event.send_time),
-                    runtime
-                );
-            }
-        }
-        Ok(())
-    }
-}
+use super::func::ExposedReturnable;
+use super::proxy::Logic;
+use super::proxy::LogicInstEvent;
 
 pub trait RuntimeExposed: Sized {
     fn setup_template(template: &mut ExposedTypeBinder<Self>);
 }
 
 pub fn create_runtime_template<'a, Exposed>(
-    scope: &'a mut v8::HandleScope<'a>,
+    scope: &mut v8::HandleScope<'a>,
 ) -> (
     v8::Local<'a, v8::ObjectTemplate>,
     RuntimeExposedBinding<Exposed>,
@@ -240,20 +62,27 @@ impl<Type> RuntimeExposedBinding<Type> {
     }
 }
 
+trait FieldAccessor {
+    fn name() -> &'static str;
+    fn num() -> usize;
+    type Source;
+    type Field: ExposedReturnable;
+    fn get(source: &Self::Source, scope: &mut v8::HandleScope) -> Self::Field;
+}
+
 pub struct ExposedTypeBinder<'a, 'b, BoundType> {
-    scope: &'a mut v8::HandleScope<'a>,
+    scope: &'b mut v8::HandleScope<'a>,
     template: &'b v8::Local<'a, v8::ObjectTemplate>,
     binding: RuntimeExposedBinding<BoundType>,
 }
 
-impl<BoundType: RuntimeExposed> ExposedTypeBinder<'_, '_, BoundType> {
-    fn set_accessor<Getter, AccessorResult>(&mut self, name: &str, getter: Getter)
+impl<'a, 'b, BoundType: RuntimeExposed> ExposedTypeBinder<'a, 'b, BoundType> {
+    fn set_accessor<Getter>(&mut self)
     where
-        Getter: Fn(&BoundType, &mut v8::HandleScope) -> AccessorResult,
-        AccessorResult : ExposedReturnable,
+        Getter: FieldAccessor,
     {
         let scope = &mut self.scope;
-        let name = v8::String::new(scope, name).unwrap();
+        let name = v8::String::new(scope, Getter::name()).unwrap();
 
         let field_num = self.binding.field_num;
         self.template.set_accessor(
@@ -263,18 +92,31 @@ impl<BoundType: RuntimeExposed> ExposedTypeBinder<'_, '_, BoundType> {
              args: v8::PropertyCallbackArguments,
              rv: v8::ReturnValue| {
                 let this = args.this();
-                let local = Self::get_external(scope, &this, field_num);
-                let result = getter(local, scope);
+                let local = Self::get_external(scope, &this, 1);
+                let result = Getter::get(local, scope);
                 result.set(rv);
             },
         );
     }
 
-    fn get_external<'a, T>(
+    fn accessor_impl<Getter: FieldAccessor>(
         scope: &mut v8::HandleScope,
-        obj: &v8::Local<'a, v8::Object>,
+        _key: v8::Local<v8::Name>,
+        args: v8::PropertyCallbackArguments,
+        rv: v8::ReturnValue,
+    ) {
+        let this = args.this();
+        todo!()
+        //let local = Self::get_external(scope, &this, Getter::num());
+        //let result = Getter::get(local, scope);
+        //result.set(rv);
+    }
+
+    fn get_external<'c, T>(
+        scope: &mut v8::HandleScope,
+        obj: &v8::Local<'c, v8::Object>,
         field_num: usize,
-    ) -> &'a T {
+    ) -> &'c T {
         let external = obj.get_internal_field(scope, field_num).unwrap();
         let external = unsafe { v8::Local::<v8::External>::cast(external) };
         unsafe { &*(external.value() as *const T) }
@@ -283,57 +125,25 @@ impl<BoundType: RuntimeExposed> ExposedTypeBinder<'_, '_, BoundType> {
 
 impl RuntimeExposed for RuntimeHandles {
     fn setup_template(template: &mut ExposedTypeBinder<Self>) {
-        template.set_accessor("deltaTime", |s, _scope| *s.delta_t);
+        template.set_accessor::<DeltaTime>();
     }
 }
 
-trait ExposedReturnable {
-    fn set(self, rv: v8::ReturnValue);
-}
-
-impl ExposedReturnable for f64 {
-    fn set(self, mut rv: v8::ReturnValue) {
-        rv.set_double(self);
+struct DeltaTime;
+impl FieldAccessor for DeltaTime {
+    type Source = RuntimeHandles;
+    type Field = f64;
+    fn get(source: &Self::Source, _scope: &mut v8::HandleScope) -> Self::Field {
+        *source.delta_t
     }
-}
 
-impl ExposedReturnable for bool {
-    fn set(self, mut rv: v8::ReturnValue) {
-        rv.set_bool(self);
+    fn name() -> &'static str {
+        "deltaTime"
     }
-}
 
-impl ExposedReturnable for i32 {
-    fn set(self, mut rv: v8::ReturnValue) {
-        rv.set_int32(self);
+    fn num() -> usize {
+        0
     }
-}
-
-impl ExposedReturnable for u32 {
-    fn set(self, mut rv: v8::ReturnValue) {
-        rv.set_uint32(self);
-    }
-}
-
-impl<'cb> ExposedReturnable for v8::Local<'cb, v8::Value> {
-    fn set(self, mut rv: v8::ReturnValue) {
-        rv.set(self);
-    }
-}
-
-impl<T : ExposedReturnable> ExposedReturnable for Option<T> {
-    fn set(self, mut rv: v8::ReturnValue) {
-        match self {
-            Some(inner) => inner.set(rv),
-            None => rv.set_null()
-        };
-    }
-}
-
-struct LogicRuntime {
-    update_counter: u64,
-    runtime: JsRuntime,
-    handles: RuntimeHandles,
 }
 
 struct RuntimeHandles {
@@ -343,18 +153,14 @@ struct RuntimeHandles {
 }
 
 impl RuntimeHandles {
-    fn new<'a>(
+    fn new(
         runtime: &mut JsRuntime,
         namespace: &v8::Global<v8::Object>,
     ) -> Result<Self, AnyError> {
         let scope = &mut runtime.handle_scope();
         let namespace = &v8::Local::new(scope, namespace);
 
-        let this_template = v8::ObjectTemplate::new(scope);
-        this_template.set_internal_field_count(1);
-
-        let delta_t_key = v8::String::new(scope, "deltaTime").unwrap();
-        this_template.set_accessor(delta_t_key.into(), Self::get_delta_t);
+        let (this_template, accessor) = create_runtime_template::<RuntimeHandles>(scope);
 
         let this = this_template.new_instance(scope).unwrap();
         let delta_t = Self::assign_delta_t(scope, this);
@@ -387,9 +193,9 @@ impl RuntimeHandles {
         rv.set_double(unsafe { *delta_t });
     }
 
-    fn set_external<'a, T>(
+    fn set_external<T>(
         scope: &mut v8::HandleScope,
-        obj: v8::Local<'a, v8::Object>,
+        obj: v8::Local<v8::Object>,
         field_num: usize,
         value: &mut Box<T>,
     ) {
@@ -397,9 +203,9 @@ impl RuntimeHandles {
         obj.set_internal_field(field_num, external.into());
     }
 
-    fn get_external<'a, T>(
+    fn get_external<T>(
         scope: &mut v8::HandleScope,
-        obj: v8::Local<'a, v8::Object>,
+        obj: v8::Local<v8::Object>,
         field_num: usize,
     ) -> *mut T {
         let external = obj.get_internal_field(scope, field_num).unwrap();
@@ -438,8 +244,29 @@ struct InvocationInfo {
     function_invocation: Duration,
 }
 
+pub struct LogicRuntime {
+    update_counter: u64,
+    pub runtime: JsRuntime,
+    handles: RuntimeHandles,
+}
+
 impl LogicRuntime {
-    async fn spawn_runtime(
+    pub async fn process_message(&mut self, event: LogicInstEvent) -> Result<(), AnyError> {
+        match event.input {
+            LogicInputEvent::Update(delta_t) => {
+                let start = Instant::now();
+                let runtime = self.on_update(delta_t)?;
+                println!(
+                    "Message delay: {:?}, took {:#?}",
+                    start.duration_since(event.send_time),
+                    runtime
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn spawn_runtime(
         module_loader: Logic,
         url: &Url,
     ) -> Result<Self, deno_core::error::AnyError> {
