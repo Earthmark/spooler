@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, rc::Rc, sync::Arc};
 
 use bevy::prelude::*;
 use deno_core::{
-    futures::FutureExt, url::Url, JsRuntime, ModuleLoader, ModuleSource, ModuleSpecifier,
+    url::Url, FastString, JsRuntime, ModuleLoader, ModuleSource, ModuleSpecifier, ModuleType,
     ResolutionKind, RuntimeOptions,
 };
 use tokio::{
@@ -52,8 +52,7 @@ pub struct LogicManifest {
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum LogicModule {
-    Direct { src: String },
-    Url { url: Url },
+    Direct { src: Arc<str> },
 }
 
 impl ManifestSection for LogicManifest {
@@ -61,8 +60,7 @@ impl ManifestSection for LogicManifest {
 
     fn spawn(&self) -> Self::LiveInstance {
         let source = match self.modules.get(&Url::parse("local://main").unwrap()) {
-            Some(LogicModule::Direct { src }) => Source::Text(src.clone()),
-            Some(LogicModule::Url { url }) => Source::Url(url.clone()),
+            Some(source) => source.clone(),
             None => panic!("a main module is required"),
         };
         Logic::new(source, vec![])
@@ -75,7 +73,7 @@ pub struct Logic {
 }
 
 impl Logic {
-    fn new(source: Source, features: Vec<Box<dyn Feature>>) -> Self {
+    fn new(source: LogicModule, features: Vec<Box<dyn Feature>>) -> Self {
         Self {
             args: Arc::new(LogicArgs { source, features }),
         }
@@ -83,23 +81,24 @@ impl Logic {
 }
 
 struct LogicArgs {
-    source: Source,
+    source: LogicModule,
     features: Vec<Box<dyn Feature>>,
 }
 
-pub enum Source {
-    Url(Url),
-    Text(String),
+lazy_static::lazy_static! {
+    static ref MAIN_URL: Url = Url::parse("local://main").unwrap();
 }
 
-impl Source {
+impl LogicModule {
     fn direct_url(&self) -> &Url {
-        lazy_static::lazy_static! {
-            static ref MAIN_URL: Url = Url::parse("local://main").unwrap();
-        }
         match self {
-            Source::Url(url) => &url,
-            Source::Text(_) => &MAIN_URL,
+            LogicModule::Direct { src: _ } => &MAIN_URL,
+        }
+    }
+
+    fn source(&self) -> &Arc<str> {
+        match self {
+            LogicModule::Direct { src } => &src,
         }
     }
 }
@@ -130,13 +129,25 @@ impl Manager {
 
 #[derive(Default)]
 struct ModuleResolver {
-    protocols: BTreeMap<String, ProtocolResolver>,
+    fallback_protocols: BTreeMap<&'static str, ProtocolResolver>,
 }
 
 impl ModuleResolver {
-    fn new() -> Self {
-        Self {
-            protocols: BTreeMap::from([("https", "")]),
+    fn load(
+        &self,
+        module_specifier: &ModuleSpecifier,
+        referrer: Option<&ModuleSpecifier>,
+        is_dyn_import: bool,
+    ) -> ModuleLoadResult {
+        match module_specifier.scheme() {
+            "http" => todo!(),
+            "https" => todo!(),
+            "local" => todo!(),
+            scheme => self.fallback_protocols.get(scheme).unwrap().load(
+                module_specifier,
+                referrer,
+                is_dyn_import,
+            ),
         }
     }
 }
@@ -144,12 +155,12 @@ impl ModuleResolver {
 enum ProtocolResolver {}
 
 impl ProtocolResolver {
-    async fn load(
+    fn load(
         &self,
         _module_specifier: &ModuleSpecifier,
-        _referrer: Option<ModuleSpecifier>,
+        _referrer: Option<&ModuleSpecifier>,
         _is_dyn_import: bool,
-    ) -> EResult<ModuleSource> {
+    ) -> ModuleLoadResult {
         todo!("Resolve protocols");
     }
 }
@@ -158,18 +169,20 @@ enum WorkerInputEvent {
     Create(Arc<LogicArgs>),
 }
 
-struct Worker(UnboundedSender<WorkerInputEvent>);
+struct Worker {
+    inputs: UnboundedSender<WorkerInputEvent>,
+}
 
 impl Worker {
     fn new(module_resolver: Arc<ModuleResolver>) -> Self {
         let (sender, recv) = unbounded_channel();
         WorkerImpl::spawn(module_resolver, recv);
-        Worker(sender)
+        Worker { inputs: sender }
     }
 
     fn create_runtime(&mut self, args: Arc<LogicArgs>) -> EResult<RuntimeConnection> {
         // Extend this to load balance.
-        self.0.send(WorkerInputEvent::Create(args))?;
+        self.inputs.send(WorkerInputEvent::Create(args))?;
         Ok(RuntimeConnection)
     }
 }
@@ -204,17 +217,21 @@ impl WorkerImpl {
     }
 
     async fn main(mut self) {
-        match self.control_src.try_recv() {
-            Ok(WorkerInputEvent::Create(arg)) => self.runtimes.push(
-                Runtime::new(self.module_resolver.clone(), arg)
-                    .await
-                    .unwrap(),
-            ),
-            Err(TryRecvError::Disconnected) => todo!("shutdown"),
-            Err(TryRecvError::Empty) => {}
-        }
+        loop {
+            match self.control_src.try_recv() {
+                Ok(WorkerInputEvent::Create(arg)) => {
+                    if let Ok(runtime) = Runtime::new(self.module_resolver.clone(), arg).await {
+                        self.runtimes.push(runtime);
+                    }
+                }
+                Err(TryRecvError::Disconnected) => todo!("shutdown"),
+                Err(TryRecvError::Empty) => {} // nothing to change.
+            }
 
-        todo!("the rest of the loop.")
+            for runtime in &mut self.runtimes {
+                runtime.run_event_loop().await.unwrap();
+            }
+        }
     }
 }
 
@@ -223,16 +240,26 @@ struct RuntimeConnection;
 struct Runtime {
     features: Vec<Box<dyn FeatureInstance>>,
     runtime: JsRuntime,
+    status: RuntimeStatus,
+}
+
+enum RuntimeStatus {
+    Running,
+    Faulted,
 }
 
 impl Runtime {
-    async fn new(resolver: Arc<ModuleResolver>, args: Arc<LogicArgs>) -> EResult<Self> {
+    async fn new(global_resolver: Arc<ModuleResolver>, args: Arc<LogicArgs>) -> EResult<Self> {
         let mut runtime = Runtime {
             runtime: JsRuntime::new(RuntimeOptions {
-                module_loader: Some(Rc::new(ResolverWrapper(resolver))),
+                module_loader: Some(Rc::new(RuntimeResolver {
+                    global_resolver,
+                    source: args.source.source().clone(),
+                })),
                 ..default()
             }),
             features: Vec::with_capacity(args.features.len()),
+            status: RuntimeStatus::Running,
         };
 
         for feature in &args.features {
@@ -250,11 +277,21 @@ impl Runtime {
 
         Ok(runtime)
     }
+
+    async fn run_event_loop(&mut self) -> EResult<()> {
+        self.runtime.run_event_loop(false).await?;
+        Ok(())
+    }
 }
 
-struct ResolverWrapper(Arc<ModuleResolver>);
+struct RuntimeResolver {
+    global_resolver: Arc<ModuleResolver>,
+    source: Arc<str>,
+}
 
-impl ModuleLoader for ResolverWrapper {
+type ModuleLoadResult = std::pin::Pin<Box<deno_core::ModuleSourceFuture>>;
+
+impl ModuleLoader for RuntimeResolver {
     fn resolve(
         &self,
         specifier: &str,
@@ -269,18 +306,17 @@ impl ModuleLoader for ResolverWrapper {
         module_specifier: &ModuleSpecifier,
         maybe_referrer: Option<&ModuleSpecifier>,
         is_dyn_import: bool,
-    ) -> std::pin::Pin<Box<deno_core::ModuleSourceFuture>> {
-        let module_specifier = module_specifier.clone();
-        let maybe_referrer = maybe_referrer.cloned();
-        let resolver = self.0.clone();
-
-        async move {
-            let resolver = resolver.protocols.get(module_specifier.scheme()).unwrap();
-            let resolved = resolver
-                .load(&module_specifier, maybe_referrer, is_dyn_import)
-                .await?;
-            Ok(resolved)
+    ) -> ModuleLoadResult {
+        if module_specifier == &*MAIN_URL {
+            let module = ModuleSource::new(
+                ModuleType::JavaScript,
+                FastString::Arc(self.source.clone()),
+                module_specifier,
+            );
+            Box::pin(async { Ok(module) })
+        } else {
+            self.global_resolver
+                .load(module_specifier, maybe_referrer, is_dyn_import)
         }
-        .boxed_local()
     }
 }
