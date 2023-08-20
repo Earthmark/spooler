@@ -5,20 +5,12 @@ use deno_core::{
     url::Url, FastString, JsRuntime, ModuleLoader, ModuleSource, ModuleSpecifier, ModuleType,
     ResolutionKind, RuntimeOptions,
 };
-use tokio::{
-    runtime::Builder,
-    sync::mpsc::{error::TryRecvError, unbounded_channel, UnboundedReceiver, UnboundedSender},
-    task::LocalSet,
-};
 
 use crate::manifest::ManifestSection;
 
-mod ecs;
 mod expose;
-mod feature;
-mod func;
-pub mod proxy;
-pub mod runtime;
+mod interop;
+mod worker;
 
 type Error = deno_core::error::AnyError;
 type EResult<T> = Result<T, Error>;
@@ -46,7 +38,7 @@ fn logic_unregistration(mut removed: RemovedComponents<Logic>, _manager: ResMut<
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct LogicManifest {
-    modules: BTreeMap<Url, LogicModule>,
+    main: LogicModule,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
@@ -59,11 +51,7 @@ impl ManifestSection for LogicManifest {
     type LiveInstance = Logic;
 
     fn spawn(&self) -> Self::LiveInstance {
-        let source = match self.modules.get(&Url::parse("local://main").unwrap()) {
-            Some(source) => source.clone(),
-            None => panic!("a main module is required"),
-        };
-        Logic::new(source, vec![])
+        Logic::new(self.main.clone(), vec![])
     }
 }
 
@@ -80,13 +68,13 @@ impl Logic {
     }
 }
 
-struct LogicArgs {
+pub struct LogicArgs {
     source: LogicModule,
     features: Vec<Box<dyn Feature>>,
 }
 
 lazy_static::lazy_static! {
-    static ref MAIN_URL: Url = Url::parse("local://main").unwrap();
+    static ref MAIN_URL: Url = Url::parse("builtin://main").unwrap();
 }
 
 impl LogicModule {
@@ -113,14 +101,15 @@ trait FeatureInstance {
 
 #[derive(Default, Resource)]
 struct Manager {
-    workers: Vec<Worker>,
+    workers: Vec<worker::Worker>,
     module_resolver: Arc<ModuleResolver>,
 }
 
 impl Manager {
     fn load_runtime(&mut self, logic: &Logic) -> EResult<RuntimeConnection> {
         if self.workers.is_empty() {
-            self.workers.push(Worker::new(self.module_resolver.clone()));
+            self.workers
+                .push(worker::Worker::new(self.module_resolver.clone()));
         }
         let worker = self.workers.get_mut(0).unwrap();
         worker.create_runtime(logic.args.clone())
@@ -128,7 +117,7 @@ impl Manager {
 }
 
 #[derive(Default)]
-struct ModuleResolver {
+pub struct ModuleResolver {
     fallback_protocols: BTreeMap<&'static str, ProtocolResolver>,
 }
 
@@ -165,77 +154,7 @@ impl ProtocolResolver {
     }
 }
 
-enum WorkerInputEvent {
-    Create(Arc<LogicArgs>),
-}
-
-struct Worker {
-    inputs: UnboundedSender<WorkerInputEvent>,
-}
-
-impl Worker {
-    fn new(module_resolver: Arc<ModuleResolver>) -> Self {
-        let (sender, recv) = unbounded_channel();
-        WorkerImpl::spawn(module_resolver, recv);
-        Worker { inputs: sender }
-    }
-
-    fn create_runtime(&mut self, args: Arc<LogicArgs>) -> EResult<RuntimeConnection> {
-        // Extend this to load balance.
-        self.inputs.send(WorkerInputEvent::Create(args))?;
-        Ok(RuntimeConnection)
-    }
-}
-
-struct WorkerImpl {
-    control_src: UnboundedReceiver<WorkerInputEvent>,
-    module_resolver: Arc<ModuleResolver>,
-    runtimes: Vec<Runtime>,
-}
-
-impl WorkerImpl {
-    fn spawn(
-        module_resolver: Arc<ModuleResolver>,
-        control_src: UnboundedReceiver<WorkerInputEvent>,
-    ) {
-        std::thread::spawn(|| {
-            let local = LocalSet::new();
-            local.spawn_local(
-                WorkerImpl {
-                    control_src,
-                    module_resolver,
-                    runtimes: default(),
-                }
-                .main(),
-            );
-            Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(local)
-        });
-    }
-
-    async fn main(mut self) {
-        loop {
-            match self.control_src.try_recv() {
-                Ok(WorkerInputEvent::Create(arg)) => {
-                    if let Ok(runtime) = Runtime::new(self.module_resolver.clone(), arg).await {
-                        self.runtimes.push(runtime);
-                    }
-                }
-                Err(TryRecvError::Disconnected) => todo!("shutdown"),
-                Err(TryRecvError::Empty) => {} // nothing to change.
-            }
-
-            for runtime in &mut self.runtimes {
-                runtime.run_event_loop().await.unwrap();
-            }
-        }
-    }
-}
-
-struct RuntimeConnection;
+pub struct RuntimeConnection;
 
 struct Runtime {
     features: Vec<Box<dyn FeatureInstance>>,
@@ -246,6 +165,15 @@ struct Runtime {
 enum RuntimeStatus {
     Running,
     Faulted,
+}
+
+impl RuntimeStatus {
+    fn should_update(&self) -> bool {
+        match self {
+            RuntimeStatus::Running => true,
+            RuntimeStatus::Faulted => false,
+        }
+    }
 }
 
 impl Runtime {
@@ -278,7 +206,17 @@ impl Runtime {
         Ok(runtime)
     }
 
-    async fn run_event_loop(&mut self) -> EResult<()> {
+    async fn run_event_loop(&mut self) {
+        if !self.status.should_update() {
+            return;
+        }
+
+        if let Err(_e) = self.run_event_loop_internal().await {
+            self.status = RuntimeStatus::Faulted;
+        }
+    }
+
+    async fn run_event_loop_internal(&mut self) -> EResult<()> {
         self.runtime.run_event_loop(false).await?;
         Ok(())
     }

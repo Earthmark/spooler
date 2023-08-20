@@ -1,11 +1,9 @@
 {
   "dom": {},
   "logic": {
-    "modules": {
-      "local://main": {
-        "type": "direct",
-        "src": "export function OnUpdate() { return Math.abs(this.deltaTime  * 20 + 5); }"
-      }
+    "main": {
+      "type": "direct",
+      "src": "export function OnUpdate() { return Math.abs(this.deltaTime  * 20 + 5); }"
     }
   },
   "assets": {
