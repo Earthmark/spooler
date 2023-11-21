@@ -9,51 +9,52 @@ pub trait RuntimeExposed: Sized {
     fn setup_template(template: &mut ExposedTypeBinder<Self>);
 }
 
-pub fn create_runtime_template<'a, Exposed>(
-    scope: &mut v8::HandleScope<'a>,
-) -> (
-    v8::Local<'a, v8::ObjectTemplate>,
-    RuntimeExposedBinding<Exposed>,
-)
-where
-    Exposed: RuntimeExposed,
-{
-    let template = v8::ObjectTemplate::new(scope);
-    template.set_internal_field_count(1);
-
-    let mut binder = ExposedTypeBinder {
-        scope,
-        template: &template,
-        binding: RuntimeExposedBinding {
-            _t: Default::default(),
-        },
-    };
-
-    Exposed::setup_template(&mut binder);
-
-    (template, binder.binding)
-}
-
-pub struct RuntimeExposedBinding<Type> {
+pub struct ProxyFactory<Type> {
     _t: PhantomData<Type>,
+    template: v8::Global<v8::ObjectTemplate>,
 }
 
-impl<Type> RuntimeExposedBinding<Type> {
-    pub fn set_internal_field(
+impl<Type: RuntimeExposed> ProxyFactory<Type> {
+    pub fn new<'a>(scope: &mut v8::HandleScope<'a>) -> Self {
+        let template = v8::ObjectTemplate::new(scope);
+        template.set_internal_field_count(1);
+
+        let mut binder = ExposedTypeBinder {
+            _t: Default::default(),
+            scope,
+            template: &template,
+        };
+
+        Type::setup_template(&mut binder);
+
+        Self {
+            _t: Default::default(),
+            template: v8::Global::new(scope, template),
+        }
+    }
+
+    pub fn proxy_pinned<'a>(
         &self,
         scope: &mut v8::HandleScope,
         obj: &mut Box<Type>,
-        target: v8::Local<v8::Object>,
-    ) {
-        let external = v8::External::new(scope, &mut **obj as *mut Type as *mut c_void);
-        target.set_internal_field(0, external.into());
+    ) -> v8::Global<v8::Object> {
+        let template = v8::Local::new(scope, &self.template);
+        let instance = template.new_instance(scope).unwrap();
+
+        Self::set_internal_field(obj, &instance);
+
+        v8::Global::new(scope, instance)
+    }
+
+    fn set_internal_field(obj: &mut Box<Type>, target: &v8::Local<v8::Object>) {
+        target.set_aligned_pointer_in_internal_field(0, &mut **obj as *mut Type as *mut c_void);
     }
 }
 
 pub struct ExposedTypeBinder<'a, 'b, BoundType> {
+    _t: PhantomData<BoundType>,
     scope: &'b mut v8::HandleScope<'a>,
     template: &'b v8::Local<'a, v8::ObjectTemplate>,
-    binding: RuntimeExposedBinding<BoundType>,
 }
 
 trait FieldAccessor<BoundType> {
@@ -77,50 +78,34 @@ impl<BoundType: RuntimeExposed> ExposedTypeBinder<'_, '_, BoundType> {
              args: v8::PropertyCallbackArguments,
              rv: v8::ReturnValue| {
                 let this = args.this();
-                let local = Self::get_external(scope, &this, 0);
-                let result = Getter::get(local, scope);
-                result.set(rv);
+                if let Some(local) = Self::get_external(&this, 0) {
+                    let result = Getter::get(local, scope);
+                    result.set(rv);
+                }
             },
         );
     }
 
-    fn get_external<'a, T>(
-        scope: &mut v8::HandleScope,
-        obj: &v8::Local<'a, v8::Object>,
-        field_num: usize,
-    ) -> &'a T {
-        let external = obj.get_internal_field(scope, field_num).unwrap();
-        let external = unsafe { v8::Local::<v8::External>::cast(external) };
-        unsafe { &*(external.value() as *const T) }
+    fn get_external<'a, T>(obj: &v8::Local<'a, v8::Object>, field_num: i32) -> Option<&'a T> {
+        let field = unsafe { obj.get_aligned_pointer_from_internal_field(field_num) as *const T };
+        if field.is_null() {
+            None
+        } else {
+            Some(unsafe { &*field })
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use deno_core::{v8, JsRuntime, RuntimeOptions};
+    use spooler_macro::RuntimeExposed;
 
     use super::*;
 
+    #[derive(RuntimeExposed)]
     struct BoundObj {
         clock: i32,
-    }
-
-    struct BoundClockAccessor;
-
-    impl FieldAccessor<BoundObj> for BoundClockAccessor {
-        type FieldResult = i32;
-        fn name() -> &'static str {
-            "clock"
-        }
-        fn get(p: &BoundObj, _scope: &mut HandleScope) -> Self::FieldResult {
-            p.clock
-        }
-    }
-
-    impl RuntimeExposed for BoundObj {
-        fn setup_template(template: &mut ExposedTypeBinder<Self>) {
-            template.set_accessor::<BoundClockAccessor>();
-        }
     }
 
     #[test]
@@ -131,17 +116,17 @@ mod tests {
             let ctx = runtime.main_context();
             let scope = &mut runtime.handle_scope();
 
-            let (template, installer) = create_runtime_template::<BoundObj>(scope);
+            let proxy_factory = ProxyFactory::<BoundObj>::new(scope);
 
             let ctx = v8::Local::new(scope, ctx);
             let global = ctx.global(scope);
 
-            let js_target = template.new_instance(scope).unwrap();
-            installer.set_internal_field(scope, &mut obj, js_target);
+            let proxy = proxy_factory.proxy_pinned(scope, &mut obj);
+            let js_target = v8::Local::new(scope, proxy);
 
             let name = v8::String::new(scope, "test_target").unwrap();
             global.set(scope, name.into(), js_target.into()).unwrap();
-        }
+        };
         let mut run_script = || {
             let value = runtime
                 .execute_script_static("test_code", "test_target.clock")

@@ -1,19 +1,26 @@
 use deno_core::v8::{Function, Global, Local, Object, Script, String};
-use deno_core::{op, v8, Extension, JsRuntime, ModuleLoader, ModuleSpecifier, RuntimeOptions};
+use deno_core::{
+    op, v8, Extension, FastString, JsRuntime, ModuleLoader, ModuleSpecifier, Op, ResolutionKind,
+    RuntimeOptions,
+};
 
+use std::borrow::Cow;
 use std::pin::Pin;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 
 #[op]
-fn op_sum(nums: Vec<f64>) -> f64 {
-    let sum = nums.iter().fold(0.0, |a, v| a + v);
+fn op_sum(numbers: Vec<f64>) -> f64 {
+    let sum = numbers.iter().fold(0.0, |a, v| a + v);
     sum
 }
 
 fn make_runtime() -> JsRuntime {
     JsRuntime::new(RuntimeOptions {
-        extensions: vec![Extension::builder().ops(vec![op_sum::decl()]).build()],
+        extensions: vec![Extension {
+            ops: Cow::from(&[op_sum::DECL][..]),
+            ..Default::default()
+        }],
         module_loader: Some(std::rc::Rc::new(ModsLoader)),
         ..Default::default()
     })
@@ -26,7 +33,7 @@ impl ModuleLoader for ModsLoader {
         &self,
         specifier: &str,
         referrer: &str,
-        _is_main: bool,
+        _kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, bevy::asset::Error> {
         assert_eq!(specifier, "file:///main.js");
         assert_eq!(referrer, ".");
@@ -37,17 +44,17 @@ impl ModuleLoader for ModsLoader {
     fn load(
         &self,
         _module_specifier: &ModuleSpecifier,
-        _maybe_referrer: Option<ModuleSpecifier>,
+        _maybe_referrer: Option<&ModuleSpecifier>,
         _is_dyn_import: bool,
     ) -> Pin<Box<deno_core::ModuleSourceFuture>> {
         todo!()
     }
 }
 
-fn load_module(runtime: &mut JsRuntime, code: &str) -> v8::Global<v8::Object> {
+fn load_module(runtime: &mut JsRuntime, code: &'static str) -> v8::Global<v8::Object> {
     let module_id = deno_core::futures::executor::block_on(runtime.load_main_module(
         &deno_core::resolve_url("file:///main.js").unwrap(),
-        Some(code.into()),
+        Some(FastString::from_static(code)),
     ))
     .unwrap();
 
@@ -89,7 +96,10 @@ fn create_and_execute_runtime(c: &mut Criterion) {
         b.iter(|| {
             let mut runtime = make_runtime();
             runtime
-                .execute_script("<usage>", r#"Deno.core.ops.op_sum([1, 2, 3]);"#)
+                .execute_script(
+                    "<usage>",
+                    FastString::from_static(r#"Deno.core.ops.op_sum([1, 2, 3]);"#),
+                )
                 .unwrap()
         })
     });
@@ -99,13 +109,20 @@ fn execute_script_over_runtime(c: &mut Criterion) {
     let mut runtime = make_runtime();
 
     c.bench_function("execute array create script", |b| {
-        b.iter(|| runtime.execute_script("<usage>", r#"[1, 2, 3];"#).unwrap())
+        b.iter(|| {
+            runtime
+                .execute_script("<usage>", FastString::from_static(r#"[1, 2, 3];"#))
+                .unwrap()
+        })
     });
 
     c.bench_function("execute two array create script", |b| {
         b.iter(|| {
             runtime
-                .execute_script("<usage>", r#"[1, 2, 3];[1, 2, 3];"#)
+                .execute_script(
+                    "<usage>",
+                    FastString::from_static(r#"[1, 2, 3];[1, 2, 3];"#),
+                )
                 .unwrap()
         })
     });
@@ -113,7 +130,10 @@ fn execute_script_over_runtime(c: &mut Criterion) {
     c.bench_function("Deno native function invoke", |b| {
         b.iter(|| {
             runtime
-                .execute_script("<usage>", r#"Deno.core.ops.op_sum([1, 2, 3]);"#)
+                .execute_script(
+                    "<usage>",
+                    FastString::from_static(r#"Deno.core.ops.op_sum([1, 2, 3]);"#),
+                )
                 .unwrap()
         })
     });

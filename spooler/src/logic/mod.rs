@@ -19,7 +19,7 @@ pub struct LogicPlugin;
 
 impl Plugin for LogicPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (logic_registration, logic_unregistration))
+        app.add_systems(Update, (logic_registration, logic_removal))
             .init_resource::<Manager>();
     }
 }
@@ -30,7 +30,7 @@ fn logic_registration(query: Query<&Logic, Added<Logic>>, mut manager: ResMut<Ma
     }
 }
 
-fn logic_unregistration(mut removed: RemovedComponents<Logic>, _manager: ResMut<Manager>) {
+fn logic_removal(mut removed: RemovedComponents<Logic>, _manager: ResMut<Manager>) {
     for _logic in &mut removed {
         println!("Entity removed");
     }

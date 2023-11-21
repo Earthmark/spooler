@@ -1,0 +1,21 @@
+[package]
+name = "spooler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy = "*"
+serde = { version = "*", features = ["derive", "rc"] }
+serde_json = "*"
+deno_core = "*"
+tokio = { version = "*", features = ["full"] }
+async-trait = "*"
+lazy_static = "*"
+spooler-macro = { path = "../spooler-macro" }
+
+[dev-dependencies]
+criterion = "*"
+
+[[bench]]
+name = "deno"
+harness = false
