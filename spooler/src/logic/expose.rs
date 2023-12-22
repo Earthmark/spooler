@@ -1,3 +1,6 @@
+use std::any::TypeId;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 
@@ -5,17 +8,34 @@ use deno_core::v8::{self, HandleScope};
 
 use super::interop::ExposedReturnable;
 
-pub trait RuntimeExposed: Sized {
-    fn setup_template(template: &mut ExposedTypeBinder<Self>);
+#[derive(Default)]
+pub struct ProxyFactory {
+    map: HashMap<TypeId, v8::Global<v8::ObjectTemplate>>,
 }
 
-pub struct ProxyFactory<Type> {
-    _t: PhantomData<Type>,
-    template: v8::Global<v8::ObjectTemplate>,
-}
+impl ProxyFactory {
+    pub fn proxy<'a, Type>(&mut self, scope: &mut HandleScope, val: &'a mut Box<Type>) -> TypeProxy<'a, Type>
+    where
+        Type: RuntimeExposed + 'static,
+    {
+        let entry = self.map.entry(TypeId::of::<Type>());
 
-impl<Type: RuntimeExposed> ProxyFactory<Type> {
-    pub fn new<'a>(scope: &mut v8::HandleScope<'a>) -> Self {
+        let template = match &entry {
+            Entry::Occupied(v) => v8::Local::new(scope, v.get()),
+            Entry::Vacant(_) => Self::create_proxy::<Type>(scope),
+        };
+
+        let proxy = TypeProxy::new_from_template(scope, template, val);
+
+        entry.or_insert_with(|| v8::Global::new(scope, template));
+
+        proxy
+    }
+
+    fn create_proxy<'a, Type>(scope: &mut HandleScope<'a>) -> v8::Local<'a, v8::ObjectTemplate>
+    where
+        Type: RuntimeExposed,
+    {
         let template = v8::ObjectTemplate::new(scope);
         template.set_internal_field_count(1);
 
@@ -27,27 +47,37 @@ impl<Type: RuntimeExposed> ProxyFactory<Type> {
 
         Type::setup_template(&mut binder);
 
-        Self {
-            _t: Default::default(),
-            template: v8::Global::new(scope, template),
-        }
+        template
     }
+}
 
-    pub fn proxy_pinned<'a>(
-        &self,
+pub trait RuntimeExposed: Sized {
+    fn setup_template(template: &mut ExposedTypeBinder<Self>);
+}
+
+pub struct TypeProxy<'a, Type> {
+    src: &'a Box<Type>,
+    proxy: v8::Global<v8::Object>,
+}
+
+impl<'a, Type> TypeProxy<'a, Type> {
+    fn new_from_template(
         scope: &mut v8::HandleScope,
-        obj: &mut Box<Type>,
-    ) -> v8::Global<v8::Object> {
-        let template = v8::Local::new(scope, &self.template);
-        let instance = template.new_instance(scope).unwrap();
-
-        Self::set_internal_field(obj, &instance);
-
-        v8::Global::new(scope, instance)
+        proxy_template: v8::Local<v8::ObjectTemplate>,
+        src: &'a mut Box<Type>,
+    ) -> Self {
+        let instance = proxy_template.new_instance(scope).unwrap();
+        Self::set_internal_field(&instance, src);
+        let proxy = v8::Global::new(scope, instance);
+        TypeProxy { src, proxy }
     }
 
-    fn set_internal_field(obj: &mut Box<Type>, target: &v8::Local<v8::Object>) {
+    fn set_internal_field(target: &v8::Local<v8::Object>, obj: &mut Box<Type>) {
         target.set_aligned_pointer_in_internal_field(0, &mut **obj as *mut Type as *mut c_void);
+    }
+
+    fn clear_internal_field(target: &v8::Local<v8::Object>) {
+        target.set_aligned_pointer_in_internal_field(0, std::ptr::null_mut());
     }
 }
 
@@ -116,13 +146,13 @@ mod tests {
             let ctx = runtime.main_context();
             let scope = &mut runtime.handle_scope();
 
-            let proxy_factory = ProxyFactory::<BoundObj>::new(scope);
+            let mut proxy_factory = ProxyFactory::default();
 
             let ctx = v8::Local::new(scope, ctx);
             let global = ctx.global(scope);
 
-            let proxy = proxy_factory.proxy_pinned(scope, &mut obj);
-            let js_target = v8::Local::new(scope, proxy);
+            let proxy = proxy_factory.proxy(scope, &mut obj);
+            let js_target = v8::Local::new(scope, proxy.proxy);
 
             let name = v8::String::new(scope, "test_target").unwrap();
             global.set(scope, name.into(), js_target.into()).unwrap();
